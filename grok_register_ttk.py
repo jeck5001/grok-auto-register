@@ -58,6 +58,24 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "cpa_export_enabled": True,
+    "cpa_auth_dir": "cpa_auths",
+    "cpa_proxy": "",
+    "cpa_headless": False,
+    "cpa_probe_after_write": True,
+    "cpa_mint_timeout_sec": 240,
+    "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
+    "cpa_force_standalone": False,
+    "cpa_mint_cookie_inject": True,
+    "cpa_mint_browser_reuse": True,
+    "cpa_mint_browser_recycle_every": 15,
+    "cpa_hotload_dir": "",
+    "cpa_copy_to_hotload": False,
+    "cpa_server_host": "",
+    "cpa_server_user": "root",
+    "cpa_server_password": "",
+    "cpa_server_auth_dir": "",
+    "token_only_file": "",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -441,6 +459,76 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+
+
+def add_token_to_token_only_file(raw_token, log_callback=None):
+    token = _normalize_sso_token(raw_token)
+    if not token:
+        return False
+    token_only_file = str(config.get("token_only_file", "") or "").strip()
+    if not token_only_file:
+        token_only_file = os.path.join(os.path.dirname(__file__), "tokens.txt")
+    try:
+        with open(token_only_file, "a", encoding="utf-8") as f:
+            f.write(f"{token}\n")
+        if log_callback:
+            log_callback(f"[+] 已写入 token 文件: {token_only_file}")
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 写入 token 文件失败: {exc}")
+        return False
+
+
+def upload_to_cpa_server(local_path, log_callback=None):
+    host = str(config.get("cpa_server_host", "") or "").strip()
+    user = str(config.get("cpa_server_user", "root") or "root").strip()
+    password = str(config.get("cpa_server_password", "") or "").strip()
+    remote_dir = str(config.get("cpa_server_auth_dir", "") or "").strip()
+    if not host or not remote_dir:
+        return False
+    try:
+        import paramiko
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(host, username=user, password=password, timeout=15)
+        sftp = ssh.open_sftp()
+        filename = os.path.basename(local_path)
+        remote_path = remote_dir.rstrip("/") + "/" + filename
+        sftp.put(local_path, remote_path)
+        try:
+            sftp.chmod(remote_path, 0o600)
+        except Exception:
+            pass
+        sftp.close()
+        ssh.close()
+        if log_callback:
+            log_callback(f"[cpa] 已上传到服务器: {host}:{remote_path}")
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[cpa] 上传到服务器失败: {exc}")
+        return False
+
+
+def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, page=None):
+    if not config.get("cpa_export_enabled", True):
+        if log_callback:
+            log_callback("[cpa] CPA 导出已禁用，跳过")
+        return {"ok": False, "skipped": True, "reason": "disabled"}
+    try:
+        from cpa_export import export_cpa_xai_for_account as _export
+        return _export(
+            email, password,
+            sso=sso,
+            page=page,
+            config=config,
+            log_callback=log_callback,
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[cpa] CPA xAI 导出失败: {exc}")
+        return {"ok": False, "error": str(exc)}
 
 
 def create_browser_options():
@@ -2805,6 +2893,20 @@ class GrokRegisterGUI:
                     sso = wait_for_sso_cookie(
                         log_callback=self.log, cancel_callback=self.should_stop
                     )
+                    cpa_thread = None
+                    cpa_result_box = {}
+                    _cpa_page = page if page is not None else None
+                    if config.get("cpa_export_enabled", True):
+                        self.log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
+                        def _cpa_mint():
+                            try:
+                                cpa_result_box["result"] = export_cpa_xai_for_account(
+                                    email, profile.get("password", ""), sso=sso, log_callback=self.log, page=_cpa_page
+                                )
+                            except Exception as e:
+                                cpa_result_box["result"] = {"ok": False, "error": str(e)}
+                        cpa_thread = threading.Thread(target=_cpa_mint, daemon=True)
+                        cpa_thread.start()
                     if config.get("enable_nsfw", True):
                         self.log("[*] 6. 开启 NSFW")
                         nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -2814,6 +2916,16 @@ class GrokRegisterGUI:
                             self.log(f"[+] NSFW 开启成功: {nsfw_msg}")
                         else:
                             self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
+                    if cpa_thread is not None:
+                        self.log("[*] 等待 CPA xAI 导出完成...")
+                        cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
+                        cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
+                        if cpa_result.get("ok"):
+                            self.log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
+                        elif cpa_result.get("skipped"):
+                            self.log(f"[cpa] CPA 导出已跳过")
+                        else:
+                            self.log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
                     self.results.append({"email": email, "sso": sso, "profile": profile})
                     try:
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
@@ -2822,6 +2934,7 @@ class GrokRegisterGUI:
                     except Exception as file_exc:
                         self.log(f"[Debug] 保存账号文件失败: {file_exc}")
                     add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
+                    add_token_to_token_only_file(sso, log_callback=self.log)
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -2966,6 +3079,20 @@ def run_registration_cli(count):
                 sso = wait_for_sso_cookie(
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
+                cpa_thread = None
+                cpa_result_box = {}
+                _cpa_page = page if page is not None else None
+                if config.get("cpa_export_enabled", True):
+                    cli_log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
+                    def _cpa_mint_cli():
+                        try:
+                            cpa_result_box["result"] = export_cpa_xai_for_account(
+                                email, profile.get("password", ""), sso=sso, log_callback=cli_log, page=_cpa_page
+                            )
+                        except Exception as e:
+                            cpa_result_box["result"] = {"ok": False, "error": str(e)}
+                    cpa_thread = threading.Thread(target=_cpa_mint_cli, daemon=True)
+                    cpa_thread.start()
                 if config.get("enable_nsfw", True):
                     cli_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -2975,6 +3102,16 @@ def run_registration_cli(count):
                         cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
+                if cpa_thread is not None:
+                    cli_log("[*] 等待 CPA xAI 导出完成...")
+                    cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
+                    cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
+                    if cpa_result.get("ok"):
+                        cli_log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
+                    elif cpa_result.get("skipped"):
+                        cli_log("[cpa] CPA 导出已跳过")
+                    else:
+                        cli_log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
                 try:
                     line = f"{email}----{profile.get('password','')}----{sso}\n"
                     with open(accounts_output_file, "a", encoding="utf-8") as f:
@@ -2982,6 +3119,7 @@ def run_registration_cli(count):
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
                 add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
+                add_token_to_token_only_file(sso, log_callback=cli_log)
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1

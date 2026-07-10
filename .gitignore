@@ -12,6 +12,9 @@ mail_credentials.txt
 *.txt
 !requirements.txt
 
+cpa_auths/
+screenshots/
+
 config.json
 config.local.json
 
