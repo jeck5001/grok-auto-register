@@ -217,6 +217,7 @@ def poll_device_token(
     log = log or _noop_log
     deadline = time.time() + max(expires_in - 5, 30)
     sleep_for = max(interval, 1)
+    fast_poll_remaining = 3
     net_streak = 0
     max_net_streak = 20
     while time.time() < deadline:
@@ -273,7 +274,10 @@ def poll_device_token(
             if err == "slow_down":
                 sleep_for = min(sleep_for + 5, 30)
             log(f"oauth poll: {err} (sleep {sleep_for}s)")
-            time.sleep(sleep_for)
+            actual_sleep = 2 if fast_poll_remaining > 0 else sleep_for
+            if fast_poll_remaining > 0:
+                fast_poll_remaining -= 1
+            time.sleep(actual_sleep)
             continue
         if err in ("expired_token", "access_denied"):
             raise OAuthDeviceError(f"device auth failed: {err}: {desc}")

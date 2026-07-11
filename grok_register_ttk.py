@@ -76,10 +76,27 @@ DEFAULT_CONFIG = {
     "cpa_server_password": "",
     "cpa_server_auth_dir": "",
     "token_only_file": "",
+    "concurrent_count": 1,
+    "browser_restart_every": 10,
+    "cpa_probe_after_write": False,
+    "cpa_mint_async": True,
+    "browser_use_custom_ua": False,
+    "log_level": "info",
+    "speed_log_interval_sec": 60,
 }
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
+_cf_domain_lock = threading.Lock()
+_io_lock = threading.Lock()
+_stats_lock = threading.Lock()
+_cpa_threads_lock = threading.Lock()
+
+_LOG_LEVEL_RANK = {
+    "quiet": 10,
+    "info": 20,
+    "debug": 30,
+}
 
 
 class RegistrationCancelled(Exception):
@@ -88,6 +105,140 @@ class RegistrationCancelled(Exception):
 
 class AccountRetryNeeded(Exception):
     pass
+
+
+def get_log_level():
+    raw = str(config.get("log_level", "info") or "info").strip().lower()
+    return raw if raw in _LOG_LEVEL_RANK else "info"
+
+
+def message_log_rank(message):
+    """根据消息内容推断日志级别。"""
+    text = str(message or "")
+    if "[Debug]" in text:
+        return _LOG_LEVEL_RANK["debug"]
+    # quiet 仅保留关键进度/结果/警告
+    if text.startswith("--- "):
+        return _LOG_LEVEL_RANK["info"]
+    quiet_prefixes = ("[+]", "[-]", "[!]")
+    if text.lstrip().startswith(quiet_prefixes) or any(
+        f" {p}" in text[:12] for p in quiet_prefixes
+    ):
+        return _LOG_LEVEL_RANK["quiet"]
+    if "[*] 速度统计" in text or text.lstrip().startswith("[*] 速度统计"):
+        return _LOG_LEVEL_RANK["quiet"]
+    if any(
+        key in text
+        for key in (
+            "[*] 1.",
+            "[*] 2.",
+            "[*] 3.",
+            "[*] 4.",
+            "[*] 5.",
+            "[*] 6.",
+            "[*] 终端模式",
+            "[*] 配置已保存",
+            "[*] 任务结束",
+            "[*] 注册成功",
+            "[+] 注册成功",
+            "Worker-",
+            "浏览器已启动",
+            "开始执行",
+            "成功账号将实时保存",
+            "按 Ctrl+C",
+            "Cloudflare 拦截",
+        )
+    ):
+        return _LOG_LEVEL_RANK["quiet"]
+    return _LOG_LEVEL_RANK["info"]
+
+
+def should_emit_log(message, level=None):
+    configured = _LOG_LEVEL_RANK[get_log_level()]
+    if level is not None:
+        msg_rank = _LOG_LEVEL_RANK.get(str(level).lower(), _LOG_LEVEL_RANK["info"])
+    else:
+        msg_rank = message_log_rank(message)
+    return msg_rank <= configured
+
+
+def emit_log(log_callback, message, *, level=None):
+    if not log_callback:
+        return
+    if not should_emit_log(message, level=level):
+        return
+    log_callback(message)
+
+
+class RateMeter:
+    """按固定间隔汇总创建速度（全局一条，避免每 worker 各打一条）。"""
+
+    def __init__(self, interval_sec=60):
+        # 允许测试用更短间隔；生产默认 60s
+        self.interval_sec = max(float(interval_sec or 60), 1.0)
+        self.t0 = time.time()
+        self.last_tick = self.t0
+        self.last_success = 0
+        self._lock = threading.Lock()
+
+    def format_line(self, success, fail=0, force=False):
+        now = time.time()
+        with self._lock:
+            elapsed = now - self.last_tick
+            if not force and elapsed < self.interval_sec:
+                return None
+            success = int(success or 0)
+            fail = int(fail or 0)
+            delta = max(success - self.last_success, 0)
+            # 正常按实际窗口折算；极短窗口（force 收尾/刚启动）用 interval 估，避免天文数字
+            if elapsed >= 1.0:
+                window = elapsed
+            else:
+                window = self.interval_sec
+            rate = delta * 60.0 / window
+            total_sec = max(now - self.t0, 0.0)
+            total_min = total_sec / 60.0
+            # 运行不足 1s 时平均速度与窗口速率对齐，避免 540/min 这类瞬时噪声
+            if total_sec >= 1.0:
+                avg = success * 60.0 / total_sec
+            else:
+                avg = rate
+            self.last_tick = now
+            self.last_success = success
+            return (
+                f"[*] 速度统计: 成功 {rate:.0f}/min | 本分钟成功 {delta} "
+                f"| 累计成功 {success} | 累计失败 {fail} | 运行 {total_min:.1f}min | 平均 {avg:.1f}/min"
+            )
+
+    def maybe_log(self, log_callback, success, fail=0, force=False):
+        line = self.format_line(success, fail=fail, force=force)
+        if line:
+            emit_log(log_callback, line, level="quiet")
+
+
+def start_speed_logger(get_counts, log_callback, stop_event, interval_sec=60):
+    """后台每 interval 打印一次全局速度；stop 后打印最终摘要。"""
+
+    meter = RateMeter(interval_sec=interval_sec)
+
+    def _loop():
+        while True:
+            if stop_event.wait(timeout=meter.interval_sec):
+                break
+            try:
+                success, fail = get_counts()
+            except Exception:
+                success, fail = 0, 0
+            meter.maybe_log(log_callback, success, fail, force=True)
+        try:
+            success, fail = get_counts()
+        except Exception:
+            success, fail = 0, 0
+        meter.maybe_log(log_callback, success, fail, force=True)
+
+    thread = threading.Thread(target=_loop, name="speed-logger", daemon=True)
+    thread.start()
+    return thread, meter
 
 
 def load_config():
@@ -214,9 +365,10 @@ def cloudflare_next_default_domain():
     domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
     if not domains:
         return ""
-    domain = domains[_cf_domain_index % len(domains)]
-    _cf_domain_index += 1
-    return domain
+    with _cf_domain_lock:
+        domain = domains[_cf_domain_index % len(domains)]
+        _cf_domain_index += 1
+        return domain
 
 
 def cloudflare_is_admin_create_path(path):
@@ -301,34 +453,37 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip()
     if not pool_name:
         pool_name = "ssoBasic"
-    os.makedirs(os.path.dirname(token_file), exist_ok=True)
-    data = {}
-    if os.path.exists(token_file):
-        try:
-            with open(token_file, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-        except Exception:
-            data = {}
-    if not isinstance(data, dict):
+    parent_dir = os.path.dirname(token_file)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+    with _io_lock:
         data = {}
-    pool = data.get(pool_name)
-    if not isinstance(pool, list):
-        pool = []
-    existing = set()
-    for item in pool:
-        if isinstance(item, str):
-            existing.add(_normalize_sso_token(item))
-        elif isinstance(item, dict):
-            existing.add(_normalize_sso_token(item.get("token", "")))
-    if token in existing:
-        if log_callback:
-            log_callback(f"[*] grok2api 本地池已存在 token: {pool_name}")
-        return True
-    entry = {"token": token, "tags": ["auto-register"], "note": email}
-    pool.append(entry)
-    data[pool_name] = pool
-    with open(token_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        if os.path.exists(token_file):
+            try:
+                with open(token_file, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+        if not isinstance(data, dict):
+            data = {}
+        pool = data.get(pool_name)
+        if not isinstance(pool, list):
+            pool = []
+        existing = set()
+        for item in pool:
+            if isinstance(item, str):
+                existing.add(_normalize_sso_token(item))
+            elif isinstance(item, dict):
+                existing.add(_normalize_sso_token(item.get("token", "")))
+        if token in existing:
+            if log_callback:
+                log_callback(f"[*] grok2api 本地池已存在 token: {pool_name}")
+            return True
+        entry = {"token": token, "tags": ["auto-register"], "note": email}
+        pool.append(entry)
+        data[pool_name] = pool
+        with open(token_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     if log_callback:
         log_callback(f"[+] 已写入 grok2api 本地池: {pool_name} ({token_file})")
     return True
@@ -469,8 +624,9 @@ def add_token_to_token_only_file(raw_token, log_callback=None):
     if not token_only_file:
         token_only_file = os.path.join(os.path.dirname(__file__), "tokens.txt")
     try:
-        with open(token_only_file, "a", encoding="utf-8") as f:
-            f.write(f"{token}\n")
+        with _io_lock:
+            with open(token_only_file, "a", encoding="utf-8") as f:
+                f.write(f"{token}\n")
         if log_callback:
             log_callback(f"[+] 已写入 token 文件: {token_only_file}")
         return True
@@ -532,9 +688,47 @@ def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, pag
 
 
 def create_browser_options():
+    """创建尽量贴近真实浏览器的启动参数。
+
+    TUN 系统代理时请保持 config.proxy 为空，让 Chromium 走系统网络栈。
+    不要默认 new_env / 强制 UA / 过多 flag，容易触发 Cloudflare「故障排除」。
+    """
     options = ChromiumOptions()
-    options.auto_port()
     options.set_timeouts(base=1)
+    # 并发时为每个 worker 分配独立资料目录，避免 cookie/会话互相污染
+    profile_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".browser_profiles")
+    try:
+        os.makedirs(profile_root, exist_ok=True)
+        wid = _get_worker_id()
+        profile_dir = os.path.join(
+            profile_root,
+            f"w{wid}_{os.getpid()}_{threading.get_ident()}_{int(time.time() * 1000) % 1000000}",
+        )
+        options.set_user_data_path(profile_dir)
+    except Exception:
+        pass
+    # set_user_data_path 可能清掉 auto_port，必须放在后面重新启用
+    options.auto_port()
+    for flag in (
+        "--no-first-run",
+        "--no-default-browser-check",
+    ):
+        options.set_argument(flag)
+    # 仅显式配置 proxy 时写入；TUN 模式保持空
+    proxy = str(config.get("proxy", "") or "").strip()
+    if proxy:
+        try:
+            options.set_proxy(proxy)
+        except Exception:
+            options.set_argument(f"--proxy-server={proxy}")
+    # 默认使用浏览器真实 UA；仅当用户显式打开时才覆盖
+    if config.get("browser_use_custom_ua", False):
+        ua = get_user_agent()
+        if ua:
+            try:
+                options.set_user_agent(ua)
+            except Exception:
+                options.set_argument(f"--user-agent={ua}")
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
@@ -578,7 +772,7 @@ def http_post(url, **kwargs):
 
 def raise_if_cancelled(cancel_callback=None):
     if cancel_callback and cancel_callback():
-        raise RegistrationCancelled("鐢ㄦ埛鍋滄娉ㄥ唽")
+        raise RegistrationCancelled("用户停止注册")
 
 
 def sleep_with_cancel(seconds, cancel_callback=None):
@@ -1367,8 +1561,84 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
-browser = None
-page = None
+_tls = threading.local()
+_cpa_async_threads: list = []
+
+
+def _wait_cpa_async_threads(timeout=300, log_callback=None, skip_if_stopping=None):
+    global _cpa_async_threads
+    if skip_if_stopping and skip_if_stopping():
+        timeout = min(float(timeout or 0), 5.0)
+        if log_callback:
+            log_callback(f"[*] 停止中，仅短暂等待 CPA mint 线程（{timeout:.0f}s）...")
+    with _cpa_threads_lock:
+        threads = [t for t in _cpa_async_threads if t.is_alive()]
+        _cpa_async_threads = [t for t in _cpa_async_threads if t.is_alive()]
+    if not threads:
+        return
+    if log_callback and not (skip_if_stopping and skip_if_stopping()):
+        log_callback(f"[*] 等待 {len(threads)} 个异步 CPA mint 线程完成...")
+    deadline = time.time() + max(float(timeout or 0), 0)
+    for t in threads:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+    alive = [t for t in threads if t.is_alive()]
+    if log_callback:
+        if alive:
+            log_callback(f"[!] {len(alive)} 个 CPA mint 线程超时未完成")
+        else:
+            log_callback("[+] 所有 CPA mint 线程已完成")
+
+
+def _track_cpa_async_thread(thread):
+    with _cpa_threads_lock:
+        _cpa_async_threads.append(thread)
+
+
+def _join_threads_interruptible(threads, should_stop=None, timeout=None, poll=0.5):
+    """可被 stop/Ctrl+C 打断的线程等待，避免 join() 永久阻塞。"""
+    threads = [t for t in (threads or []) if t is not None]
+    if not threads:
+        return
+    deadline = None if timeout is None else (time.time() + max(float(timeout), 0))
+    while any(t.is_alive() for t in threads):
+        if should_stop and should_stop():
+            # 给 worker 一点时间走 finally/stop_browser，再返回
+            grace_deadline = time.time() + 3
+            while any(t.is_alive() for t in threads) and time.time() < grace_deadline:
+                for t in threads:
+                    t.join(timeout=poll)
+            return
+        if deadline is not None and time.time() >= deadline:
+            return
+        for t in threads:
+            t.join(timeout=poll)
+
+
+def _get_browser():
+    return getattr(_tls, 'browser', None)
+
+
+def _set_browser(b):
+    _tls.browser = b
+
+
+def _get_page():
+    return getattr(_tls, 'page', None)
+
+
+def _set_page(p):
+    _tls.page = p
+
+
+def _get_worker_id():
+    return getattr(_tls, 'worker_id', 0)
+
+
+def _set_worker_id(wid):
+    _tls.worker_id = wid
 
 
 def setup_light_theme(root):
@@ -1473,47 +1743,156 @@ def tk_option_menu(parent, variable, values, width=12):
 
 
 def start_browser(log_callback=None):
-    global browser, page
     last_exc = None
     for attempt in range(1, 5):
         try:
-            browser = Chromium(create_browser_options())
-            tabs = browser.get_tabs()
-            page = tabs[-1] if tabs else browser.new_tab()
-            if log_callback and getattr(browser, "user_data_path", None):
-                log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
+            _set_browser(Chromium(create_browser_options()))
+            tabs = _get_browser().get_tabs()
+            _set_page(tabs[-1] if tabs else _get_browser().new_tab())
+            if log_callback and getattr(_get_browser(), "user_data_path", None):
+                log_callback(f"[Debug] 当前浏览器资料目录: {_get_browser().user_data_path}")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
-            return browser, page
+            return _get_browser(), _get_page()
         except Exception as exc:
             last_exc = exc
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
             try:
-                if browser is not None:
-                    browser.quit(del_data=True)
+                if _get_browser() is not None:
+                    _get_browser().quit(del_data=True)
             except Exception:
                 pass
-            browser = None
-            page = None
+            _set_browser(None)
+            _set_page(None)
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    global browser, page
+    profile_path = None
+    browser = _get_browser()
     if browser is not None:
+        try:
+            profile_path = getattr(browser, "user_data_path", None)
+        except Exception:
+            profile_path = None
         try:
             browser.quit(del_data=True)
         except Exception:
             pass
-    browser = None
-    page = None
+    _set_browser(None)
+    _set_page(None)
+    if profile_path:
+        try:
+            import shutil
+
+            root = os.path.abspath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".browser_profiles")
+            )
+            abs_profile = os.path.abspath(str(profile_path))
+            if abs_profile.startswith(root) and os.path.isdir(abs_profile):
+                shutil.rmtree(abs_profile, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def restart_browser(log_callback=None):
     stop_browser()
     return start_browser(log_callback=log_callback)
+
+
+def prepare_clean_browser_session(log_callback=None, cancel_callback=None):
+    """轻量清理：避免预访问 xAI/grok 触发 Cloudflare，同时尽量清掉残留登录态。"""
+    raise_if_cancelled(cancel_callback)
+    page = _get_page()
+    browser = _get_browser()
+    if page is None or browser is None:
+        start_browser(log_callback=log_callback)
+        page = _get_page()
+        browser = _get_browser()
+    try:
+        if page is not None:
+            try:
+                page.get("about:blank")
+            except Exception:
+                pass
+            try:
+                page.run_js(
+                    """
+try { localStorage.clear(); } catch (e) {}
+try { sessionStorage.clear(); } catch (e) {}
+"""
+                )
+            except Exception:
+                pass
+        # 尽量清 cookie，但不主动打开 accounts.x.ai / grok.com（容易先撞 CF）
+        if browser is not None and hasattr(browser, "set_cookies"):
+            try:
+                browser.set_cookies(False)
+            except Exception:
+                pass
+        if page is not None and hasattr(page, "set_cookies"):
+            try:
+                page.set_cookies(False)
+            except Exception:
+                pass
+        if log_callback:
+            log_callback("[Debug] 已做轻量会话清理，准备打开注册页")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 清理浏览器会话失败，将重启浏览器: {exc}")
+        restart_browser(log_callback=log_callback)
+
+
+def detect_cloudflare_block_page(log_callback=None):
+    """检测当前页是否为 Cloudflare 拦截/故障排除页。"""
+    page = _get_page()
+    if page is None:
+        return False, ""
+    try:
+        info = page.run_js(
+            r"""
+const body = ((document.body && (document.body.innerText || document.body.textContent)) || '')
+  .replace(/\s+/g, ' ').trim().slice(0, 500);
+const title = document.title || '';
+const html = (document.documentElement && document.documentElement.innerHTML || '').slice(0, 2000);
+return { url: location.href || '', title, body, html };
+"""
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 读取页面检测 CF 失败: {exc}")
+        return False, ""
+    if not isinstance(info, dict):
+        return False, ""
+    blob = " ".join(
+        [
+            str(info.get("url") or ""),
+            str(info.get("title") or ""),
+            str(info.get("body") or ""),
+            str(info.get("html") or ""),
+        ]
+    ).lower()
+    markers = (
+        "故障排除",
+        "attention required",
+        "cf-error",
+        "cf-error-details",
+        "sorry, you have been blocked",
+        "you have been blocked",
+        "checking your browser before accessing",
+        "enable javascript and cookies",
+        "cloudflare ray id",
+        "error code 1020",
+        "error code 1005",
+        "access denied",
+    )
+    hit = next((m for m in markers if m in blob), "")
+    if not hit:
+        return False, ""
+    detail = f"url={info.get('url') or ''}; marker={hit}; title={info.get('title') or ''}"
+    return True, detail
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
@@ -1526,29 +1905,20 @@ def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
 
 
 def refresh_active_page():
-    global browser, page
-    if browser is None:
+    if _get_browser() is None:
         restart_browser()
     try:
-        tabs = browser.get_tabs()
+        tabs = _get_browser().get_tabs()
         if tabs:
-            page = tabs[-1]
+            _set_page(tabs[-1])
         else:
-            page = browser.new_tab()
+            _set_page(_get_browser().new_tab())
     except Exception:
         restart_browser()
-    return page
+    return _get_page()
 
 
-def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
-    global page
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        if log_callback:
-            log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
-
-        clicked = page.run_js(r"""
+_EMAIL_SIGNUP_JS = r"""
 function isVisible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
@@ -1562,76 +1932,291 @@ function nodeText(node) {
         node.textContent,
         node.getAttribute('aria-label'),
         node.getAttribute('title'),
+        node.getAttribute('value'),
         node.getAttribute('href'),
+        node.getAttribute('data-testid'),
+        node.getAttribute('name'),
+        node.getAttribute('id'),
     ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 }
 function scoreEntry(node) {
-    const compact = nodeText(node).replace(/\s+/g, '');
+    const text = nodeText(node);
+    const compact = text.replace(/\s+/g, '');
     const lower = compact.toLowerCase();
-    if (compact.includes('使用邮箱注册')) return 100;
-    if (lower.includes('signupwithemail')) return 95;
-    if (lower.includes('continuewithemail')) return 90;
-    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with'))) return 80;
-    if (lower === 'email' || lower.includes('邮箱')) return 70;
+    if (compact.includes('使用邮箱注册') || compact.includes('用邮箱注册') || compact.includes('邮箱注册')) return 100;
+    if (lower.includes('signupwithemail') || lower.includes('sign-up-with-email') || lower.includes('sign_up_with_email')) return 95;
+    if (lower.includes('continuewithemail') || lower.includes('continue-with-email')) return 90;
+    if ((lower.includes('email') || compact.includes('邮箱')) &&
+        (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with') || compact.includes('注册') || compact.includes('继续'))) {
+        return 80;
+    }
+    if (lower === 'email' || lower === '邮箱' || compact.includes('电子邮箱')) return 70;
     return 0;
 }
-const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map((node) => ({ node, score: scoreEntry(node), text: nodeText(node) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-const target = candidates[0]?.node || null;
-if (!target) {
+function emailInputReady() {
+    const selectors = [
+        'input[data-testid="email"]',
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[autocomplete="email"]',
+        'input[placeholder*="mail" i]',
+        'input[aria-label*="mail" i]',
+        'input[aria-label*="邮箱"]',
+        'input[placeholder*="邮箱"]',
+    ];
+    for (const sel of selectors) {
+        const node = document.querySelector(sel);
+        if (node && isVisible(node) && !node.disabled && !node.readOnly) return true;
+    }
     return false;
 }
-target.click();
-return candidates[0].text || true;
-        """)
+function collectCandidates() {
+    const nodes = Array.from(document.querySelectorAll(
+        'button, a, [role="button"], input[type="button"], input[type="submit"], div[role="button"], span[role="button"]'
+    ));
+    return nodes
+        .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
+        .map((node) => ({ node, score: scoreEntry(node), text: nodeText(node) }))
+        .filter((item) => item.score > 0)
+        .sort((a, b) => b.score - a.score);
+}
+const url = location.href || '';
+const title = document.title || '';
+const bodyText = (document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+const candidates = collectCandidates();
+const buttons = candidates.slice(0, 8).map((item) => item.text || '').filter(Boolean);
+if (emailInputReady()) {
+    return {
+        state: 'email-form-ready',
+        url,
+        title,
+        buttons,
+        body: bodyText,
+    };
+}
+const target = candidates[0] || null;
+if (!target) {
+    return {
+        state: 'not-found',
+        url,
+        title,
+        buttons: Array.from(document.querySelectorAll('button, a, [role="button"]'))
+            .filter((node) => isVisible(node))
+            .map(nodeText)
+            .filter(Boolean)
+            .slice(0, 10),
+        body: bodyText,
+    };
+}
+try { target.node.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+target.node.click();
+return {
+    state: 'clicked',
+    text: target.text || true,
+    url,
+    title,
+    buttons,
+    body: bodyText,
+};
+"""
 
-        if clicked:
+
+def _signup_page_snapshot(log_callback=None):
+    page = _get_page()
+    if page is None:
+        return {"url": "none", "title": "", "buttons": [], "body": ""}
+    try:
+        snap = page.run_js(
+            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function nodeText(node) {
+  return [node.innerText, node.textContent, node.getAttribute('aria-label'), node.getAttribute('title'), node.getAttribute('href')]
+    .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+return {
+  url: location.href || '',
+  title: document.title || '',
+  buttons: Array.from(document.querySelectorAll('button, a, [role="button"]'))
+    .filter((n) => isVisible(n))
+    .map(nodeText)
+    .filter(Boolean)
+    .slice(0, 12),
+  body: ((document.body && (document.body.innerText || document.body.textContent)) || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+  hasEmail: !!document.querySelector('input[type="email"], input[name="email"], input[data-testid="email"]'),
+};
+"""
+        )
+        if isinstance(snap, dict):
+            return snap
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 读取注册页快照失败: {exc}")
+    try:
+        return {
+            "url": getattr(page, "url", "") or "",
+            "title": "",
+            "buttons": [],
+            "body": (page.html or "")[:300],
+            "hasEmail": False,
+        }
+    except Exception:
+        return {"url": "none", "title": "", "buttons": [], "body": "", "hasEmail": False}
+
+
+def click_email_signup_button(timeout=18, log_callback=None, cancel_callback=None):
+    deadline = time.time() + timeout
+    last_diag = 0.0
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
+        if blocked:
+            raise Exception(f"Cloudflare 拦截页，无法点击邮箱注册: {detail}")
+        if log_callback:
+            log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
+
+        try:
+            clicked = _get_page().run_js(_EMAIL_SIGNUP_JS)
+        except Exception as exc:
             if log_callback:
-                detail = f": {clicked}" if isinstance(clicked, str) else ""
+                log_callback(f"[Debug] 查找邮箱注册按钮异常: {exc}")
+            clicked = None
+
+        state = clicked.get("state") if isinstance(clicked, dict) else clicked
+        if state in ("clicked", True) or (isinstance(clicked, str) and clicked):
+            detail = ""
+            if isinstance(clicked, dict):
+                detail = f": {clicked.get('text')}" if clicked.get("text") else ""
+            elif isinstance(clicked, str):
+                detail = f": {clicked}"
+            if log_callback:
                 log_callback(f"[*] 已点击「使用邮箱注册」按钮{detail}")
-            sleep_with_cancel(2, cancel_callback)
+            sleep_with_cancel(1.5, cancel_callback)
+            return True
+        if state == "email-form-ready":
+            if log_callback:
+                log_callback("[*] 已处于邮箱注册表单，跳过入口按钮点击")
             return True
 
-        if log_callback:
-            current_url = page.url if page else "none"
-            log_callback(f"[Debug] 当前URL: {current_url}")
+        now = time.time()
+        if log_callback and now - last_diag >= 2:
+            last_diag = now
+            snap = clicked if isinstance(clicked, dict) else _signup_page_snapshot(log_callback)
+            url = (snap or {}).get("url") or (_get_page().url if _get_page() else "none")
+            buttons = " | ".join((snap or {}).get("buttons") or []) or "none"
+            body = ((snap or {}).get("body") or "")[:160]
+            log_callback(f"[Debug] 当前URL: {url}; buttons={buttons}; body={body}")
 
-        sleep_with_cancel(1, cancel_callback)
+        # 页面若仍空白/未加载完，主动再刷一次注册页
+        try:
+            url_now = (_get_page().url if _get_page() else "") or ""
+            if "about:blank" in url_now or not url_now:
+                _get_page().get(SIGNUP_URL)
+                _get_page().wait.doc_loaded()
+        except Exception:
+            pass
+        sleep_with_cancel(0.8, cancel_callback)
 
+    blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
+    if blocked:
+        raise Exception(f"Cloudflare 拦截页，无法点击邮箱注册: {detail}")
+    snap = _signup_page_snapshot(log_callback)
     if log_callback:
-        page_html = page.html[:500] if page else "no page"
-        log_callback(f"[Debug] 页面内容片段: {page_html}")
-
-    raise Exception("未找到「使用邮箱注册」按钮")
+        log_callback(
+            f"[Debug] 页面内容片段: url={snap.get('url')}; title={snap.get('title')}; "
+            f"buttons={' | '.join(snap.get('buttons') or []) or 'none'}; body={(snap.get('body') or '')[:300]}"
+        )
+    fail_url = str(snap.get("url") or "unknown")
+    fail_buttons = " | ".join(snap.get("buttons") or []) or "none"
+    residual_hint = ""
+    low = fail_url.lower()
+    if any(k in low for k in ("tos-gate", "accept-tos", "/tos", "grok.com")) or any(
+        k in fail_buttons for k in ("知道了", "Got it", "I understand")
+    ):
+        residual_hint = "；疑似上号会话/TOS 残留（非缺点击流程），账号结束后将完整重启浏览器"
+    raise Exception(
+        "未找到「使用邮箱注册」按钮"
+        f"（url={fail_url}; buttons={fail_buttons}{residual_hint}）"
+    )
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
-    global browser, page
     raise_if_cancelled(cancel_callback)
-    if browser is None:
-        start_browser()
+    if _get_browser() is None:
+        start_browser(log_callback=log_callback)
         if log_callback:
             log_callback("[*] 浏览器已启动")
-    try:
-        page = browser.get_tab(0)
-        page.get(SIGNUP_URL)
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[Debug] 打开URL异常: {e}")
+        if not os.path.exists(EXTENSION_PATH) and log_callback:
+            log_callback("[!] 未找到 turnstilePatch 扩展目录，Turnstile 辅助可能不可用")
+    prepare_clean_browser_session(log_callback=log_callback, cancel_callback=cancel_callback)
+    last_exc = None
+    opened = False
+    for attempt in range(1, 4):
+        raise_if_cancelled(cancel_callback)
         try:
-            page = browser.new_tab(SIGNUP_URL)
-        except Exception as e2:
+            browser = _get_browser()
+            if browser is None:
+                start_browser(log_callback=log_callback)
+                browser = _get_browser()
+            try:
+                tabs = browser.get_tabs()
+                _set_page(tabs[0] if tabs else browser.new_tab())
+            except Exception:
+                _set_page(browser.new_tab())
+            _get_page().get(SIGNUP_URL)
+            _get_page().wait.doc_loaded()
+            # 给 CF/前端一点渲染时间
+            sleep_with_cancel(1.2, cancel_callback)
+            blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
+            if blocked:
+                last_exc = Exception(f"Cloudflare 拦截页: {detail}")
+                if log_callback:
+                    log_callback(f"[!] 检测到 Cloudflare 拦截/故障排除页，重启浏览器重试 ({attempt}/3): {detail}")
+                restart_browser(log_callback=log_callback)
+                sleep_with_cancel(1.5, cancel_callback)
+                continue
+            last_exc = None
+            opened = True
+            break
+        except RegistrationCancelled:
+            raise
+        except Exception as e:
+            last_exc = e
             if log_callback:
-                log_callback(f"[Debug] 创建新标签页异常: {e2}")
-            restart_browser()
-            page = browser.new_tab(SIGNUP_URL)
-    page.wait.doc_loaded()
-    sleep_with_cancel(2, cancel_callback)
+                log_callback(f"[Debug] 打开注册页失败(第{attempt}/3次): {e}")
+            try:
+                restart_browser(log_callback=log_callback)
+            except Exception as e2:
+                if log_callback:
+                    log_callback(f"[Debug] 重启浏览器失败: {e2}")
+            sleep_with_cancel(1, cancel_callback)
+    if not opened:
+        raise Exception(f"打开注册页失败: {last_exc}")
+
+    _deadline = time.time() + 10
+    while time.time() < _deadline:
+        raise_if_cancelled(cancel_callback)
+        blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
+        if blocked:
+            if log_callback:
+                log_callback(f"[!] 注册页加载后仍是 Cloudflare 拦截页: {detail}")
+            raise Exception(f"Cloudflare 拦截页: {detail}")
+        try:
+            _ready = _get_page().run_js(
+                "return !!document.querySelector('button, input[type=\"email\"], a[href*=\"sign\"], a[href*=\"email\"], form')"
+            )
+            if _ready:
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
     if log_callback:
-        log_callback(f"[*] 当前URL: {page.url}")
+        log_callback(f"[*] 当前URL: {_get_page().url}")
     click_email_signup_button(
         log_callback=log_callback, cancel_callback=cancel_callback
     )
@@ -1641,7 +2226,7 @@ def has_profile_form(log_callback=None):
     refresh_active_page()
     try:
         return bool(
-            page.run_js(
+            _get_page().run_js(
                 """
 const givenInput = document.querySelector('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
 const familyInput = document.querySelector('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
@@ -1667,7 +2252,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     last_snapshot = None
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        filled = page.run_js(
+        filled = _get_page().run_js(
             """
 const email = arguments[0];
 function isVisible(node) {
@@ -1770,51 +2355,28 @@ return {
         if state == "not-ready":
             now = time.time()
             if now - last_reclick_time >= 3:
-                reclicked = page.run_js(r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function nodeText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('href'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function scoreEntry(node) {
-    const compact = nodeText(node).replace(/\s+/g, '');
-    const lower = compact.toLowerCase();
-    if (compact.includes('使用邮箱注册')) return 100;
-    if (lower.includes('signupwithemail')) return 95;
-    if (lower.includes('continuewithemail')) return 90;
-    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with'))) return 80;
-    if (lower === 'email' || lower.includes('邮箱')) return 70;
-    return 0;
-}
-const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map((node) => ({ node, score: scoreEntry(node), text: nodeText(node) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-if (!candidates.length) return false;
-candidates[0].node.click();
-return candidates[0].text || true;
-                """)
+                try:
+                    reclicked = _get_page().run_js(_EMAIL_SIGNUP_JS)
+                except Exception:
+                    reclicked = None
                 last_reclick_time = now
-                if reclicked and log_callback:
-                    detail = f": {reclicked}" if isinstance(reclicked, str) else ""
-                    log_callback(f"[Debug] 邮箱输入框未出现，已再次触发邮箱注册入口{detail}")
+                re_state = reclicked.get("state") if isinstance(reclicked, dict) else reclicked
+                if re_state == "email-form-ready":
+                    if log_callback:
+                        log_callback("[Debug] 邮箱输入框检测中：页面已进入邮箱表单")
+                elif re_state in ("clicked", True) or (isinstance(reclicked, str) and reclicked):
+                    detail = ""
+                    if isinstance(reclicked, dict) and reclicked.get("text"):
+                        detail = f": {reclicked.get('text')}"
+                    elif isinstance(reclicked, str):
+                        detail = f": {reclicked}"
+                    if log_callback:
+                        log_callback(f"[Debug] 邮箱输入框未出现，已再次触发邮箱注册入口{detail}")
             if log_callback and now - last_diag_time >= 5:
                 last_diag_time = now
                 inputs = " | ".join((filled or {}).get("inputs", [])[:6]) if isinstance(filled, dict) else ""
                 buttons = " | ".join((filled or {}).get("buttons", [])[:8]) if isinstance(filled, dict) else ""
-                url = (filled or {}).get("url", page.url if page else "") if isinstance(filled, dict) else (page.url if page else "")
+                url = (filled or {}).get("url", _get_page().url if _get_page() else "") if isinstance(filled, dict) else (_get_page().url if _get_page() else "")
                 log_callback(f"[Debug] 等待邮箱输入框: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}")
             sleep_with_cancel(0.5, cancel_callback)
             continue
@@ -1824,7 +2386,7 @@ return candidates[0].text || true;
             sleep_with_cancel(0.5, cancel_callback)
             continue
         sleep_with_cancel(0.8, cancel_callback)
-        clicked = page.run_js(
+        clicked = _get_page().run_js(
             r"""
 function isVisible(node) {
     if (!node) return false;
@@ -1907,7 +2469,7 @@ return 'enter';
     if last_snapshot:
         inputs = " | ".join(last_snapshot.get("inputs", [])[:6])
         buttons = " | ".join(last_snapshot.get("buttons", [])[:8])
-        url = last_snapshot.get("url", page.url if page else "")
+        url = last_snapshot.get("url", _get_page().url if _get_page() else "")
         raise Exception(
             f"未找到邮箱输入框或注册按钮，最后页面: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
         )
@@ -1916,7 +2478,7 @@ return 'enter';
 
 def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cancel_callback=None):
     def _resend_code():
-        page.run_js(
+        _get_page().run_js(
             r"""
 const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 const target = nodes.find((node) => {
@@ -1942,7 +2504,7 @@ return false;
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
-        filled = page.run_js(
+        filled = _get_page().run_js(
             """
 const code = String(arguments[0] || '').trim();
 if (!code) return 'empty-code';
@@ -2012,7 +2574,7 @@ return 'not-ready';
             sleep_with_cancel(0.5, cancel_callback)
             continue
 
-        clicked = page.run_js(
+        clicked = _get_page().run_js(
             r"""
 function isVisible(node) {
     if (!node) return false;
@@ -2057,12 +2619,11 @@ return 'clicked';
 
 
 def getTurnstileToken(log_callback=None, cancel_callback=None):
-    global page
-    if page is None:
+    if _get_page() is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
     try:
-        page.run_js(
+        _get_page().run_js(
             "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
         )
     except Exception:
@@ -2071,7 +2632,7 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     for _ in range(0, 20):
         raise_if_cancelled(cancel_callback)
         try:
-            token = page.run_js(
+            token = _get_page().run_js(
                 """
 try {
   const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
@@ -2089,7 +2650,7 @@ try {
                     log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
 
-            challenge_input = page.ele("@name=cf-turnstile-response")
+            challenge_input = _get_page().ele("@name=cf-turnstile-response")
             if challenge_input:
                 wrapper = challenge_input.parent()
                 iframe = None
@@ -2120,7 +2681,7 @@ Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
                         pass
             else:
                 # 兜底：尝试触发页面上可见的 Turnstile 容器
-                page.run_js(
+                _get_page().run_js(
                     """
 const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
   const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
@@ -2171,7 +2732,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         if not form_filled_once:
-            filled = page.run_js(
+            filled = _get_page().run_js(
                 """
 const givenName = arguments[0];
 const familyName = arguments[1];
@@ -2249,8 +2810,8 @@ return 'filled-no-submit';
 
             if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
                 form_filled_once = True
+                token_len = filled.split(":", 1)[1] if ":" in filled else "0"
                 if log_callback:
-                    token_len = filled.split(":", 1)[1] if ":" in filled else "0"
                     log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
                 if token_len == "0":
                     pause_seconds = random.uniform(1, 3)
@@ -2267,7 +2828,7 @@ return 'filled-no-submit';
                     try:
                         token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
                         if token:
-                            synced = page.run_js(
+                            synced = _get_page().run_js(
                                 """
 const token = String(arguments[0] || '').trim();
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
@@ -2300,7 +2861,7 @@ return String(cfInput.value || '').trim().length;
                 sleep_with_cancel(0.5, cancel_callback)
                 continue
 
-        submit_state = page.run_js(
+        submit_state = _get_page().run_js(
             r"""
 function isVisible(node) {
     if (!node) return false;
@@ -2358,7 +2919,7 @@ return 'submitted';
                 try:
                     token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
                     if token:
-                        synced = page.run_js(
+                        synced = _get_page().run_js(
                             """
 const token = String(arguments[0] || '').trim();
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
@@ -2409,14 +2970,14 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
         raise_if_cancelled(cancel_callback)
         try:
             refresh_active_page()
-            if page is None:
+            if _get_page() is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
             # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
             now = time.time()
             if now - last_submit_retry >= 2.5:
-                retried = page.run_js(
+                retried = _get_page().run_js(
                     r"""
 function isVisible(node) {
     if (!node) return false;
@@ -2489,7 +3050,7 @@ return 'final-page-clicked-submit';
                         try:
                             token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
                             if token:
-                                synced = page.run_js(
+                                synced = _get_page().run_js(
                                     """
 const token = String(arguments[0] || '').trim();
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
@@ -2510,7 +3071,7 @@ return String(cfInput.value || '').trim().length;
                                 log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
                         last_cf_retry_at = now
 
-            cookies = page.cookies(all_domains=True, all_info=True) or []
+            cookies = _get_page().cookies(all_domains=True, all_info=True) or []
             for item in cookies:
                 if isinstance(item, dict):
                     name = str(item.get("name", "")).strip()
@@ -2746,11 +3307,23 @@ class GrokRegisterGUI:
         self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()}")
 
     def log(self, message):
+        if not should_emit_log(message):
+            return
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
         print(line, flush=True)
-        self.log_text.insert(tk.END, f"{line}\n")
-        self.log_text.see(tk.END)
+        try:
+            self.log_text.insert(tk.END, f"{line}\n")
+            # 防止长时间运行日志区无限增长导致卡顿
+            try:
+                line_count = int(float(str(self.log_text.index("end-1c").split(".")[0])))
+                if line_count > 5000:
+                    self.log_text.delete("1.0", f"{line_count - 4000}.0")
+            except Exception:
+                pass
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
 
     def clear_log(self):
         self.log_text.delete(1.0, tk.END)
@@ -2826,345 +3399,672 @@ class GrokRegisterGUI:
         self.log("[!] 用户停止注册")
 
     def run_registration(self, count):
-        try:
-            start_browser(log_callback=self.log)
-            self.log("[*] 浏览器已启动")
-            i = 0
-            retry_count_for_slot = 0
-            max_slot_retry = 3
-            while i < count:
-                if self.should_stop():
-                    break
-                self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-                try:
-                    email = ""
-                    dev_token = ""
-                    code = ""
-                    mail_ok = False
-                    max_mail_retry = 3
-                    for mail_try in range(1, max_mail_retry + 1):
-                        self.log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                        open_signup_page(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
-                        self.log("[*] 2. 创建邮箱并提交")
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
-                        self.log(f"[*] 邮箱: {email}")
-                        self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                        try:
-                            with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
-                        except Exception:
-                            pass
-                        self.log("[*] 3. 拉取验证码")
-                        try:
-                            code = fill_code_and_submit(
-                                email,
-                                dev_token,
-                                log_callback=self.log,
-                                cancel_callback=self.should_stop,
-                            )
-                            mail_ok = True
-                            break
-                        except Exception as mail_exc:
-                            msg = str(mail_exc)
-                            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                                self.log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(log_callback=self.log)
-                                sleep_with_cancel(1, self.should_stop)
-                                continue
-                            raise
+        stop_speed = threading.Event()
+        interval = float(config.get("speed_log_interval_sec", 60) or 60)
+        def _gui_counts():
+            with _stats_lock:
+                return self.success_count, self.fail_count
 
-                    if not mail_ok:
-                        raise Exception("验证码阶段失败，已达到最大重试次数")
-                    self.log(f"[*] 验证码: {code}")
-                    self.log("[*] 4. 填写资料")
-                    profile = fill_profile_and_submit(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
-                    self.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    self.log("[*] 5. 等待 sso cookie")
-                    sso = wait_for_sso_cookie(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
-                    cpa_thread = None
-                    cpa_result_box = {}
-                    _cpa_page = page if page is not None else None
-                    if config.get("cpa_export_enabled", True):
-                        self.log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
-                        def _cpa_mint():
-                            try:
-                                cpa_result_box["result"] = export_cpa_xai_for_account(
-                                    email, profile.get("password", ""), sso=sso, log_callback=self.log, page=_cpa_page
-                                )
-                            except Exception as e:
-                                cpa_result_box["result"] = {"ok": False, "error": str(e)}
-                        cpa_thread = threading.Thread(target=_cpa_mint, daemon=True)
-                        cpa_thread.start()
-                    if config.get("enable_nsfw", True):
-                        self.log("[*] 6. 开启 NSFW")
-                        nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                            sso, log_callback=self.log
-                        )
-                        if nsfw_ok:
-                            self.log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                        else:
-                            self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                    if cpa_thread is not None:
-                        self.log("[*] 等待 CPA xAI 导出完成...")
-                        cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
-                        cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
-                        if cpa_result.get("ok"):
-                            self.log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
-                        elif cpa_result.get("skipped"):
-                            self.log(f"[cpa] CPA 导出已跳过")
-                        else:
-                            self.log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
-                    self.results.append({"email": email, "sso": sso, "profile": profile})
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
-                    except Exception as file_exc:
-                        self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
-                    add_token_to_token_only_file(sso, log_callback=self.log)
-                    self.success_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    self.log(f"[+] 注册成功: {email}")
-                    if (
-                        self.success_count > 0
-                        and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
-                        and i < count
-                    ):
-                        cleanup_runtime_memory(
-                            log_callback=self.log,
-                            reason=f"已成功 {self.success_count} 个账号，执行定期清理",
-                        )
-                except RegistrationCancelled:
-                    self.log("[!] 注册被用户停止")
-                    break
-                except AccountRetryNeeded as exc:
-                    retry_count_for_slot += 1
-                    if retry_count_for_slot <= max_slot_retry:
-                        self.log(
-                            f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                        )
-                    else:
-                        self.fail_count += 1
-                        self.log(
-                            f"[-] 当前账号已达到最大重试次数，跳过: {exc}"
-                        )
-                        retry_count_for_slot = 0
-                        i += 1
-                except Exception as exc:
-                    self.fail_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    self.log(f"[-] 注册失败: {exc}")
-                finally:
-                    self.update_stats()
-                    if self.should_stop():
-                        break
-                    if browser is None:
-                        start_browser(log_callback=self.log)
-                    else:
-                        restart_browser(log_callback=self.log)
-                    sleep_with_cancel(1, self.should_stop)
+        speed_thread, _meter = start_speed_logger(
+            get_counts=_gui_counts,
+            log_callback=self.log,
+            stop_event=stop_speed,
+            interval_sec=interval,
+        )
+        try:
+            concurrent = max(1, int(config.get("concurrent_count", 1) or 1))
+            self.log(f"[*] 日志级别: {get_log_level()} | 速度统计间隔: {int(interval)}s")
+            if concurrent <= 1:
+                self._run_single_worker(count, worker_id=0)
+            else:
+                self._run_concurrent_workers(count, concurrent)
         except Exception as exc:
             self.log(f"[!] 任务异常: {exc}")
         finally:
-            stop_browser()
+            stop_speed.set()
+            try:
+                speed_thread.join(timeout=2)
+            except Exception:
+                pass
+            _wait_cpa_async_threads(
+                timeout=5 if self.should_stop() else 300,
+                log_callback=self.log,
+                skip_if_stopping=self.should_stop,
+            )
             self._set_running_ui(False)
-            self.log("[*] 任务结束")
+            self.log(
+                f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
+            )
+
+    def _run_concurrent_workers(self, total_count, worker_count):
+        import queue
+        task_queue = queue.Queue()
+        for idx in range(total_count):
+            task_queue.put(idx)
+        threads = []
+        for wid in range(worker_count):
+            if self.should_stop():
+                break
+            t = threading.Thread(
+                target=self._worker_loop,
+                args=(wid, task_queue, total_count),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+            sleep_with_cancel(2, self.should_stop)
+        _join_threads_interruptible(
+            threads,
+            should_stop=self.should_stop,
+            timeout=None,
+            poll=0.5,
+        )
+        if self.should_stop():
+            _join_threads_interruptible(threads, should_stop=None, timeout=5, poll=0.5)
+
+    def _worker_loop(self, worker_id, task_queue, total_count):
+        _set_worker_id(worker_id)
+        prefix = f"[W{worker_id}]"
+        log_fn = lambda msg: self.log(f"{prefix} {msg}")
+        try:
+            start_browser(log_callback=log_fn)
+            log_fn(f"[*] Worker-{worker_id} 浏览器已启动")
+        except Exception as e:
+            log_fn(f"[!] Worker-{worker_id} 浏览器启动失败: {e}")
+            return
+        restart_every = int(config.get("browser_restart_every", 10) or 0)
+        local_success = 0
+        local_attempts = 0
+        max_slot_retry = 3
+        try:
+            while not self.should_stop():
+                try:
+                    task_queue.get_nowait()
+                except Exception:
+                    break
+                slot_done = False
+                retry_count_for_slot = 0
+                while not slot_done and not self.should_stop():
+                    try:
+                        self._register_one_account(log_fn, worker_id, local_success)
+                        local_success += 1
+                        slot_done = True
+                    except RegistrationCancelled:
+                        return
+                    except AccountRetryNeeded as exc:
+                        retry_count_for_slot += 1
+                        if retry_count_for_slot <= max_slot_retry:
+                            log_fn(
+                                f"[!] 账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
+                            )
+                            restart_browser(log_callback=log_fn)
+                            continue
+                        with _stats_lock:
+                            self.fail_count += 1
+                        log_fn(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                        slot_done = True
+                    except Exception as exc:
+                        with _stats_lock:
+                            self.fail_count += 1
+                        log_fn(f"[-] 注册失败: {exc}")
+                        slot_done = True
+                    finally:
+                        local_attempts += 1
+                        self.update_stats()
+                        if self.should_stop():
+                            break
+                        # 与稳定版/单 worker 一致：每账号完整重启，避免 SSO/TOS 会话残留落到 tos-gate
+                        if _get_browser() is None:
+                            start_browser(log_callback=log_fn)
+                        else:
+                            if restart_every > 0 and local_attempts % restart_every == 0:
+                                log_fn(
+                                    f"[*] Worker-{worker_id} 已处理 {local_attempts} 个账号，周期重启浏览器"
+                                )
+                            restart_browser(log_callback=log_fn)
+                        sleep_with_cancel(1, self.should_stop)
+        finally:
+            stop_browser()
+
+    def _register_one_account(self, log_fn, worker_id=0, local_success=0):
+        email = ""
+        dev_token = ""
+        code = ""
+        mail_ok = False
+        max_mail_retry = 3
+        for mail_try in range(1, max_mail_retry + 1):
+            log_fn(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+            open_signup_page(log_callback=log_fn, cancel_callback=self.should_stop)
+            log_fn("[*] 2. 创建邮箱并提交")
+            email, dev_token = fill_email_and_submit(
+                log_callback=log_fn, cancel_callback=self.should_stop
+            )
+            log_fn(f"[*] 邮箱: {email}")
+            try:
+                with _io_lock:
+                    with open(
+                        os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                        "a", encoding="utf-8",
+                    ) as f:
+                        f.write(f"{email}\t{dev_token}\n")
+            except Exception:
+                pass
+            log_fn("[*] 3. 拉取验证码")
+            try:
+                code = fill_code_and_submit(
+                    email, dev_token,
+                    log_callback=log_fn, cancel_callback=self.should_stop,
+                )
+                mail_ok = True
+                break
+            except Exception as mail_exc:
+                msg = str(mail_exc)
+                if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                    log_fn(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                    restart_browser(log_callback=log_fn)
+                    sleep_with_cancel(1, self.should_stop)
+                    continue
+                raise
+        if not mail_ok:
+            raise Exception("验证码阶段失败，已达到最大重试次数")
+        log_fn(f"[*] 验证码: {code}")
+        log_fn("[*] 4. 填写资料")
+        profile = fill_profile_and_submit(
+            log_callback=log_fn, cancel_callback=self.should_stop
+        )
+        log_fn(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+        log_fn("[*] 5. 等待 sso cookie")
+        sso = wait_for_sso_cookie(
+            log_callback=log_fn, cancel_callback=self.should_stop
+        )
+        _cpa_page = _get_page()
+        if config.get("cpa_export_enabled", True):
+            cpa_async = bool(config.get("cpa_mint_async", True))
+            if cpa_async:
+                log_fn("[*] 6. CPA xAI 导出 (异步)")
+                _cpa_bg_page = None
+                def _cpa_mint_bg():
+                    time.sleep(5)
+                    try:
+                        r = export_cpa_xai_for_account(
+                            email, profile.get("password", ""), sso=sso,
+                            log_callback=log_fn, page=_cpa_bg_page,
+                        )
+                        if r.get("ok"):
+                            log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
+                        elif not r.get("skipped"):
+                            log_fn(f"[!] CPA xAI 导出失败: {r.get('error', '未知错误')}")
+                    except Exception as e:
+                        log_fn(f"[!] CPA xAI 导出异常: {e}")
+                _t = threading.Thread(target=_cpa_mint_bg, daemon=True)
+                _t.start()
+                _track_cpa_async_thread(_t)
+            else:
+                log_fn("[*] 6. CPA xAI 导出 (同步)")
+                cpa_result = export_cpa_xai_for_account(
+                    email, profile.get("password", ""), sso=sso,
+                    log_callback=log_fn, page=_cpa_page,
+                )
+                if cpa_result.get("ok"):
+                    log_fn(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
+                elif not cpa_result.get("skipped"):
+                    log_fn(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+        if config.get("enable_nsfw", True):
+            log_fn("[*] 6. 开启 NSFW")
+            nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log_fn)
+            if nsfw_ok:
+                log_fn(f"[+] NSFW 开启成功: {nsfw_msg}")
+            else:
+                log_fn(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
+        with _stats_lock:
+            self.results.append({"email": email, "sso": sso, "profile": profile})
+        try:
+            line = f"{email}----{profile.get('password','')}----{sso}\n"
+            with _io_lock:
+                with open(self.accounts_output_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception as file_exc:
+            log_fn(f"[Debug] 保存账号文件失败: {file_exc}")
+        add_token_to_grok2api_pools(sso, email=email, log_callback=log_fn)
+        add_token_to_token_only_file(sso, log_callback=log_fn)
+        with _stats_lock:
+            self.success_count += 1
+        log_fn(f"[+] 注册成功: {email}")
+
+    def _run_single_worker(self, count, worker_id=0):
+        _set_worker_id(worker_id)
+        start_browser(log_callback=self.log)
+        self.log("[*] 浏览器已启动")
+        restart_every = int(config.get("browser_restart_every", 10) or 0)
+        i = 0
+        retry_count_for_slot = 0
+        max_slot_retry = 3
+        while i < count:
+            if self.should_stop():
+                break
+            self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            try:
+                self._register_one_account(self.log, worker_id, i)
+                retry_count_for_slot = 0
+                i += 1
+                if restart_every > 0 and i > 0 and i % restart_every == 0:
+                    self.log(f"[*] 已注册 {i} 个账号，重启浏览器")
+                    restart_browser(log_callback=self.log)
+                if (
+                    self.success_count > 0
+                    and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
+                    and i < count
+                ):
+                    cleanup_runtime_memory(
+                        log_callback=self.log,
+                        reason=f"已成功 {self.success_count} 个账号，执行定期清理",
+                    )
+            except RegistrationCancelled:
+                self.log("[!] 注册被用户停止")
+                break
+            except AccountRetryNeeded as exc:
+                retry_count_for_slot += 1
+                if retry_count_for_slot <= max_slot_retry:
+                    self.log(f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}")
+                else:
+                    with _stats_lock:
+                        self.fail_count += 1
+                    self.log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                    retry_count_for_slot = 0
+                    i += 1
+            except Exception as exc:
+                with _stats_lock:
+                    self.fail_count += 1
+                retry_count_for_slot = 0
+                i += 1
+                self.log(f"[-] 注册失败: {exc}")
+            finally:
+                self.update_stats()
+                if self.should_stop():
+                    break
+                if _get_browser() is None:
+                    start_browser(log_callback=self.log)
+                else:
+                    restart_browser(log_callback=self.log)
+                sleep_with_cancel(1, self.should_stop)
+        stop_browser()
 
 
 class CliStopController:
     def __init__(self):
         self.stop_requested = False
+        self._sigint_count = 0
+        self._lock = threading.Lock()
 
     def should_stop(self):
         return self.stop_requested
 
     def stop(self):
-        self.stop_requested = True
+        with self._lock:
+            self.stop_requested = True
+
+    def handle_sigint(self, signum=None, frame=None):
+        """第一次 Ctrl+C 请求优雅停止；第二次强制退出。"""
+        with self._lock:
+            self._sigint_count += 1
+            count = self._sigint_count
+            self.stop_requested = True
+        if count == 1:
+            cli_log("[!] 收到 Ctrl+C，正在停止...（再按一次强制退出）")
+            return
+        cli_log("[!] 再次收到 Ctrl+C，强制退出")
+        try:
+            os._exit(1)
+        except Exception:
+            raise SystemExit(1)
 
 
 def cli_log(message):
+    if not should_emit_log(message):
+        return
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
 
 
+def _install_cli_sigint_handler(controller):
+    """安装可重入的 Ctrl+C 处理。Windows/Git Bash 下尽量可用。"""
+    previous = None
+    try:
+        import signal
+
+        previous = signal.getsignal(signal.SIGINT)
+
+        def _handler(signum, frame):
+            controller.handle_sigint(signum, frame)
+
+        signal.signal(signal.SIGINT, _handler)
+        return previous
+    except Exception:
+        return previous
+
+
+def _restore_sigint_handler(previous):
+    try:
+        import signal
+
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+    except Exception:
+        pass
+
+
+def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
+    email = ""
+    dev_token = ""
+    code = ""
+    mail_ok = False
+    max_mail_retry = 3
+    for mail_try in range(1, max_mail_retry + 1):
+        log_fn(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+        open_signup_page(log_callback=log_fn, cancel_callback=stop_fn)
+        log_fn("[*] 2. 创建邮箱并提交")
+        email, dev_token = fill_email_and_submit(
+            log_callback=log_fn, cancel_callback=stop_fn
+        )
+        log_fn(f"[*] 邮箱: {email}")
+        try:
+            with _io_lock:
+                with open(
+                    os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                    "a", encoding="utf-8",
+                ) as f:
+                    f.write(f"{email}\t{dev_token}\n")
+        except Exception:
+            pass
+        log_fn("[*] 3. 拉取验证码")
+        try:
+            code = fill_code_and_submit(
+                email, dev_token,
+                log_callback=log_fn, cancel_callback=stop_fn,
+            )
+            mail_ok = True
+            break
+        except Exception as mail_exc:
+            msg = str(mail_exc)
+            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                log_fn(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                restart_browser(log_callback=log_fn)
+                sleep_with_cancel(1, stop_fn)
+                continue
+            raise
+    if not mail_ok:
+        raise Exception("验证码阶段失败，已达到最大重试次数")
+    log_fn(f"[*] 验证码: {code}")
+    log_fn("[*] 4. 填写资料")
+    profile = fill_profile_and_submit(
+        log_callback=log_fn, cancel_callback=stop_fn
+    )
+    log_fn(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+    log_fn("[*] 5. 等待 sso cookie")
+    sso = wait_for_sso_cookie(
+        log_callback=log_fn, cancel_callback=stop_fn
+    )
+    _cpa_page = _get_page()
+    if config.get("cpa_export_enabled", True):
+        cpa_async = bool(config.get("cpa_mint_async", True))
+        if cpa_async:
+            log_fn("[*] 6. CPA xAI 导出 (异步)")
+            _cpa_bg_page = None
+            def _cpa_mint_bg():
+                time.sleep(5)
+                try:
+                    r = export_cpa_xai_for_account(
+                        email, profile.get("password", ""), sso=sso,
+                        log_callback=log_fn, page=_cpa_bg_page,
+                    )
+                    if r.get("ok"):
+                        log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
+                    elif not r.get("skipped"):
+                        log_fn(f"[!] CPA xAI 导出失败: {r.get('error', '未知错误')}")
+                except Exception as e:
+                    log_fn(f"[!] CPA xAI 导出异常: {e}")
+            _t = threading.Thread(target=_cpa_mint_bg, daemon=True)
+            _t.start()
+            _track_cpa_async_thread(_t)
+        else:
+            log_fn("[*] 6. CPA xAI 导出 (同步)")
+            cpa_result = export_cpa_xai_for_account(
+                email, profile.get("password", ""), sso=sso,
+                log_callback=log_fn, page=_cpa_page,
+            )
+            if cpa_result.get("ok"):
+                log_fn(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
+            elif not cpa_result.get("skipped"):
+                log_fn(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+    if config.get("enable_nsfw", True):
+        log_fn("[*] 6. 开启 NSFW")
+        nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log_fn)
+        if nsfw_ok:
+            log_fn(f"[+] NSFW 开启成功: {nsfw_msg}")
+        else:
+            log_fn(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
+    try:
+        line = f"{email}----{profile.get('password','')}----{sso}\n"
+        with _io_lock:
+            with open(accounts_output_file, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception as file_exc:
+        log_fn(f"[Debug] 保存账号文件失败: {file_exc}")
+    add_token_to_grok2api_pools(sso, email=email, log_callback=log_fn)
+    add_token_to_token_only_file(sso, log_callback=log_fn)
+    log_fn(f"[+] 注册成功: {email}")
+
+
+def _cli_worker_loop(worker_id, task_queue, total_count, controller, accounts_output_file, stats):
+    _set_worker_id(worker_id)
+    prefix = f"[W{worker_id}]"
+    log_fn = lambda msg: cli_log(f"{prefix} {msg}")
+    try:
+        start_browser(log_callback=log_fn)
+        log_fn(f"[*] Worker-{worker_id} 浏览器已启动")
+    except Exception as e:
+        log_fn(f"[!] Worker-{worker_id} 浏览器启动失败: {e}")
+        return
+    restart_every = int(config.get("browser_restart_every", 10) or 0)
+    local_success = 0
+    local_attempts = 0
+    max_slot_retry = 3
+    try:
+        while not controller.should_stop():
+            try:
+                task_queue.get_nowait()
+            except Exception:
+                break
+            slot_done = False
+            retry_count_for_slot = 0
+            while not slot_done and not controller.should_stop():
+                try:
+                    _register_one_account_cli(log_fn, controller.should_stop, accounts_output_file)
+                    with stats["lock"]:
+                        stats["success"] += 1
+                        local_success += 1
+                    slot_done = True
+                except RegistrationCancelled:
+                    return
+                except AccountRetryNeeded as exc:
+                    retry_count_for_slot += 1
+                    if retry_count_for_slot <= max_slot_retry:
+                        log_fn(
+                            f"[!] 账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
+                        )
+                        restart_browser(log_callback=log_fn)
+                        continue
+                    with stats["lock"]:
+                        stats["fail"] += 1
+                    log_fn(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                    slot_done = True
+                except Exception as exc:
+                    with stats["lock"]:
+                        stats["fail"] += 1
+                    log_fn(f"[-] 注册失败: {exc}")
+                    slot_done = True
+                finally:
+                    local_attempts += 1
+                    if controller.should_stop():
+                        break
+                    # 与稳定版/单 worker 一致：每账号完整重启，避免 SSO/TOS 会话残留落到 tos-gate
+                    if _get_browser() is None:
+                        start_browser(log_callback=log_fn)
+                    else:
+                        if restart_every > 0 and local_attempts % restart_every == 0:
+                            log_fn(
+                                f"[*] Worker-{worker_id} 已处理 {local_attempts} 个账号，周期重启浏览器"
+                            )
+                        restart_browser(log_callback=log_fn)
+                    sleep_with_cancel(1, controller.should_stop)
+    finally:
+        stop_browser()
+
+
 def run_registration_cli(count):
     controller = CliStopController()
-    success_count = 0
-    fail_count = 0
-    retry_count_for_slot = 0
-    max_slot_retry = 3
+    prev_handler = _install_cli_sigint_handler(controller)
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
-    cli_log(f"[*] 终端模式启动，目标数量: {count}")
-    cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
-    try:
-        start_browser(log_callback=cli_log)
-        cli_log("[*] 浏览器已启动")
-        i = 0
-        while i < count:
-            if controller.should_stop():
-                break
-            cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-            try:
-                email = ""
-                dev_token = ""
-                code = ""
-                mail_ok = False
-                max_mail_retry = 3
-                for mail_try in range(1, max_mail_retry + 1):
-                    cli_log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                    open_signup_page(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token = fill_email_and_submit(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log(f"[*] 邮箱: {email}")
-                    cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                    try:
-                        with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
-                    except Exception:
-                        pass
-                    cli_log("[*] 3. 拉取验证码")
-                    try:
-                        code = fill_code_and_submit(
-                            email,
-                            dev_token,
-                            log_callback=cli_log,
-                            cancel_callback=controller.should_stop,
-                        )
-                        mail_ok = True
-                        break
-                    except Exception as mail_exc:
-                        msg = str(mail_exc)
-                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                            cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(log_callback=cli_log)
-                            sleep_with_cancel(1, controller.should_stop)
-                            continue
-                        raise
+    worker_count = max(1, int(config.get("concurrent_count", 1) or 1))
+    stats = {"success": 0, "fail": 0, "lock": threading.Lock()}
+    stop_speed = threading.Event()
+    interval = float(config.get("speed_log_interval_sec", 60) or 60)
 
-                if not mail_ok:
-                    raise Exception("验证码阶段失败，已达到最大重试次数")
-                cli_log(f"[*] 验证码: {code}")
-                cli_log("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
-                cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                cli_log("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
-                cpa_thread = None
-                cpa_result_box = {}
-                _cpa_page = page if page is not None else None
-                if config.get("cpa_export_enabled", True):
-                    cli_log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
-                    def _cpa_mint_cli():
-                        try:
-                            cpa_result_box["result"] = export_cpa_xai_for_account(
-                                email, profile.get("password", ""), sso=sso, log_callback=cli_log, page=_cpa_page
-                            )
-                        except Exception as e:
-                            cpa_result_box["result"] = {"ok": False, "error": str(e)}
-                    cpa_thread = threading.Thread(target=_cpa_mint_cli, daemon=True)
-                    cpa_thread.start()
-                if config.get("enable_nsfw", True):
-                    cli_log("[*] 6. 开启 NSFW")
-                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, log_callback=cli_log
-                    )
-                    if nsfw_ok:
-                        cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                    else:
-                        cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                if cpa_thread is not None:
-                    cli_log("[*] 等待 CPA xAI 导出完成...")
-                    cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
-                    cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
-                    if cpa_result.get("ok"):
-                        cli_log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
-                    elif cpa_result.get("skipped"):
-                        cli_log("[cpa] CPA 导出已跳过")
-                    else:
-                        cli_log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
-                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
-                add_token_to_token_only_file(sso, log_callback=cli_log)
-                success_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[+] 注册成功: {email}")
-                cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
-                if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
-                    cleanup_runtime_memory(
-                        log_callback=cli_log,
-                        reason=f"已成功 {success_count} 个账号，执行定期清理",
-                    )
-            except RegistrationCancelled:
-                cli_log("[!] 注册被停止")
-                break
-            except AccountRetryNeeded as exc:
-                retry_count_for_slot += 1
-                if retry_count_for_slot <= max_slot_retry:
-                    cli_log(
-                        f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                    )
-                else:
-                    fail_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
-            except Exception as exc:
-                fail_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[-] 注册失败: {exc}")
-            finally:
+    def _cli_counts():
+        with stats["lock"]:
+            return stats["success"], stats["fail"]
+
+    speed_thread, _meter = start_speed_logger(
+        get_counts=_cli_counts,
+        log_callback=cli_log,
+        stop_event=stop_speed,
+        interval_sec=interval,
+    )
+    cli_log(f"[*] 终端模式启动，目标数量: {count}，并发: {worker_count}")
+    cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    cli_log(f"[*] 日志级别: {get_log_level()} | 速度统计间隔: {int(interval)}s")
+    cli_log("[*] 按 Ctrl+C 停止（连按两次强制退出）")
+    try:
+        if worker_count > 1:
+            import queue
+            task_queue = queue.Queue()
+            for idx in range(count):
+                task_queue.put(idx)
+            threads = []
+            for wid in range(worker_count):
                 if controller.should_stop():
                     break
-                if browser is None:
-                    start_browser(log_callback=cli_log)
-                else:
-                    restart_browser(log_callback=cli_log)
-                sleep_with_cancel(1, controller.should_stop)
+                t = threading.Thread(
+                    target=_cli_worker_loop,
+                    args=(wid, task_queue, count, controller, accounts_output_file, stats),
+                    daemon=True,
+                )
+                t.start()
+                threads.append(t)
+                # 可中断的启动间隔
+                sleep_with_cancel(2, controller.should_stop)
+            _join_threads_interruptible(
+                threads,
+                should_stop=controller.should_stop,
+                timeout=None,
+                poll=0.5,
+            )
+            if controller.should_stop():
+                cli_log("[!] 已请求停止，等待 worker 收尾...")
+                _join_threads_interruptible(
+                    threads,
+                    should_stop=None,
+                    timeout=5,
+                    poll=0.5,
+                )
+        else:
+            start_browser(log_callback=cli_log)
+            cli_log("[*] 浏览器已启动")
+            restart_every = int(config.get("browser_restart_every", 10) or 0)
+            i = 0
+            retry_count_for_slot = 0
+            max_slot_retry = 3
+            while i < count:
+                if controller.should_stop():
+                    break
+                cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+                try:
+                    _register_one_account_cli(cli_log, controller.should_stop, accounts_output_file)
+                    with stats["lock"]:
+                        stats["success"] += 1
+                    retry_count_for_slot = 0
+                    i += 1
+                    cli_log(f"[*] 当前统计: 成功 {stats['success']} | 失败 {stats['fail']}")
+                    if restart_every > 0 and i > 0 and i % restart_every == 0:
+                        cli_log(f"[*] 已注册 {i} 个账号，重启浏览器")
+                        restart_browser(log_callback=cli_log)
+                    if (
+                        stats["success"] > 0
+                        and stats["success"] % MEMORY_CLEANUP_INTERVAL == 0
+                        and i < count
+                    ):
+                        cleanup_runtime_memory(
+                            log_callback=cli_log,
+                            reason=f"已成功 {stats['success']} 个账号，执行定期清理",
+                        )
+                except RegistrationCancelled:
+                    cli_log("[!] 注册被停止")
+                    break
+                except AccountRetryNeeded as exc:
+                    retry_count_for_slot += 1
+                    if retry_count_for_slot <= max_slot_retry:
+                        cli_log(
+                            f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
+                        )
+                    else:
+                        with stats["lock"]:
+                            stats["fail"] += 1
+                        retry_count_for_slot = 0
+                        i += 1
+                        cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                except Exception as exc:
+                    with stats["lock"]:
+                        stats["fail"] += 1
+                    retry_count_for_slot = 0
+                    i += 1
+                    cli_log(f"[-] 注册失败: {exc}")
+                finally:
+                    if controller.should_stop():
+                        break
+                    if _get_browser() is None:
+                        start_browser(log_callback=cli_log)
+                    else:
+                        restart_browser(log_callback=cli_log)
+                    sleep_with_cancel(1, controller.should_stop)
     except KeyboardInterrupt:
         controller.stop()
-        cli_log("[!] 收到 Ctrl+C，正在停止并清理")
+        cli_log("[!] 收到 KeyboardInterrupt，正在停止并清理")
     except Exception as exc:
         cli_log(f"[!] 任务异常: {exc}")
     finally:
-        cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
-        cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
+        stop_speed.set()
+        try:
+            speed_thread.join(timeout=2)
+        except Exception:
+            pass
+        stopping = controller.should_stop()
+        controller.stop()
+        _wait_cpa_async_threads(
+            timeout=5 if stopping else 300,
+            log_callback=cli_log,
+            skip_if_stopping=(lambda: stopping),
+        )
+        try:
+            cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
+        except Exception as clean_exc:
+            cli_log(f"[Debug] 结束清理异常: {clean_exc}")
+        _restore_sigint_handler(prev_handler)
+        with stats["lock"]:
+            ok, bad = stats["success"], stats["fail"]
+        cli_log(f"[*] 任务结束。成功 {ok} | 失败 {bad}")
 
 
 def main_cli():

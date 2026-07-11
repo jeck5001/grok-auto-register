@@ -174,8 +174,7 @@ def build_cpa_xai_auth(
 
     if disabled:
         payload["disabled"] = True
-    if headers:
-        payload["headers"] = dict(headers)
+    payload["headers"] = dict(headers) if headers is not None else dict(DEFAULT_CLIENT_HEADERS)
     if extra:
         for k, v in extra.items():
             if k not in payload:

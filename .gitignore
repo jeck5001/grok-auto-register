@@ -24,3 +24,4 @@ config.local.json
 .vscode/
 DrissionPage/
 autoPortData/
+.browser_profiles/

@@ -28,6 +28,13 @@
   "cpa_probe_after_write": true,
   "cpa_mint_timeout_sec": 240,
   "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
+  "cpa_headers": {
+    "x-grok-client-version": "0.2.93",
+    "x-xai-token-auth": "xai-grok-cli",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-identifier": "grok-shell",
+    "User-Agent": "grok-shell/0.2.93 (linux; x86_64)"
+  },
   "cpa_force_standalone": false,
   "cpa_mint_cookie_inject": true,
   "cpa_mint_browser_reuse": true,
@@ -38,5 +45,11 @@
   "cpa_server_user": "root",
   "cpa_server_password": "",
   "cpa_server_auth_dir": "",
-  "token_only_file": ""
+  "token_only_file": "",
+  "concurrent_count": 1,
+  "browser_restart_every": 10,
+  "cpa_mint_async": true,
+  "browser_use_custom_ua": false,
+  "log_level": "info",
+  "speed_log_interval_sec": 60
 }

@@ -27,6 +27,7 @@ def mint_and_export(
     proxy: str | None = None,
     headless: bool = False,
     base_url: str = DEFAULT_BASE_URL,
+    headers: dict[str, str] | None = None,
     probe: bool = True,
     probe_chat: bool = False,
     browser_timeout_sec: float = 240.0,
@@ -77,6 +78,7 @@ def mint_and_export(
         id_token=tokens.get("id_token"),
         expires_in=tokens.get("expires_in"),
         base_url=base_url,
+        headers=headers,
     )
     path = write_cpa_xai_auth(auth_dir, payload)
     log(f"wrote {path}")

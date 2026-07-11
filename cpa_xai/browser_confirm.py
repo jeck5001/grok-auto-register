@@ -240,10 +240,17 @@ def create_standalone_page(
     else:
         log("browser proxy=(none)")
 
-    browser = Chromium(opts)
-    page = browser.latest_tab
-    log("standalone chromium started")
-    return browser, page
+    for _attempt in range(3):
+        try:
+            browser = Chromium(opts)
+            page = browser.latest_tab
+            log("standalone chromium started")
+            return browser, page
+        except Exception as e:
+            log(f"chromium start attempt {_attempt+1}/3 failed: {e}")
+            if _attempt < 2:
+                _sleep(3.0)
+    raise BrowserConfirmError("chromium failed to start after 3 attempts")
 
 
 def close_standalone(browser: Any) -> None:
@@ -376,7 +383,7 @@ def inject_cookies(page: Any, cookies: Any, log: LogFn | None = None) -> int:
         return 0
     for url in (
         "https://accounts.x.ai/",
-        "https://auth.x.ai/",
+
         "https://grok.com/",
     ):
         try:
